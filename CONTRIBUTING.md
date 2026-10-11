@@ -73,6 +73,17 @@ Repeat with a polygon crop and keep the companion `*-overview.copc.laz` file alo
 Record the plugin installation path as well as its version to distinguish a local fix from a release
 with the same version number.
 
+#### Recorded point-cloud validation
+
+| QGIS | Environment | Evidence | Scope |
+|------|-------------|----------|-------|
+| 3.44.13 | Windows, Qt5 | Local automated tests at commit `5d8fdcc` | Full QGIS smoke suite, including cropping, overview rendering, cache reuse and failure/cancellation checks; real cropped-data rendering and saved-project verification |
+| 4.2.3 | Windows, Qt6 | Manual confirmation by TheAlistairRoss on 2026-10-11, local fix build at commit `5d8fdcc` | Point-cloud cropping and rendering reported working |
+
+The QGIS 4.2.3 confirmation does not imply that the full automated suite, cache/cancellation cases
+or every plugin feature was tested on that version. These fixes remain unreleased until merged and
+included in an upstream release; the local build still identifies itself as plugin version 0.14.6.
+
 Exact polygon point-cloud checks also run in the full QGIS smoke suite. For a focused check on Windows,
 run QGIS's `python-qgis-ltr.bat` with the absolute path to `tests\crop_test_qgis.py`. It uses a temporary
 directory and removes its synthetic sources/results afterwards. The checks cover

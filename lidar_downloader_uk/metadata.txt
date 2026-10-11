@@ -19,6 +19,11 @@ repository=https://github.com/simonstoate/LidarDownloaderUK
 homepage=https://github.com/simonstoate/LidarDownloaderUK
 
 changelog=
+    Unreleased - Point-cloud loading, exact polygon cropping and cached zoomed-out overviews.
+          - Cropping and rendering manually confirmed by TheAlistairRoss on Windows with
+            QGIS 4.2.3 (Qt6), 2026-10-11, local fix build at commit 5d8fdcc.
+          - Automated regression and real-data checks passed locally on QGIS 3.44.13 (Qt5).
+            The QGIS 4.2.3 report covers manual cropping/rendering, not the full automated suite.
     0.14.6 - Changes from first use, to keep things simple and the data exactly as downloaded:
           - Each 5 km tile loads as one layer, read straight from the downloaded files; only
             Create mosaic and Crop to join tiles.

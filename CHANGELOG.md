@@ -4,6 +4,10 @@ All notable changes to LIDAR Downloader UK, newest first. 0.14.3 is the first pu
 
 ## Unreleased
 
+- Point-cloud polygon cropping and zoomed-out rendering manually confirmed working by
+  TheAlistairRoss on QGIS 4.2.3 (Windows, Qt6), 2026-10-11, using the local fix build at
+  commit `5d8fdcc`. This complements automated regression testing on QGIS 3.44.13;
+  it is not a report of the full automated suite running on QGIS 4.2.3.
 - VPCs on QGIS 3.42+ now display a cached point overview when zoomed out instead of only file outlines.
   Full-detail sources remain unchanged. Loading upgrades existing full-tile and cropped VPCs without
   repeating conversion/cropping, preserves point styling, and refreshes already loaded layers.
