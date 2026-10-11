@@ -4,6 +4,10 @@ All notable changes to LIDAR Downloader UK, newest first. 0.14.3 is the first pu
 
 ## Unreleased
 
+- VPCs on QGIS 3.42+ now display a cached point overview when zoomed out instead of only file outlines.
+  Full-detail sources remain unchanged. Loading upgrades existing full-tile and cropped VPCs without
+  repeating conversion/cropping, preserves point styling, and refreshes already loaded layers.
+  Overview builds are cancellable and failed builds do not replace an existing VPC.
 - **Exact point-cloud polygon loading:** Crop to now clips LAS/LAZ to selected polygons, including
   holes and multipart sites. Actual file-header bounds reject outside files before indexing;
   intersecting ordinary files are cropped first and only retained points become COPC/VPC copies.

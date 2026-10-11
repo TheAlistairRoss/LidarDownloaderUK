@@ -2187,13 +2187,7 @@ class LidarDownloader:
         if not pointclouds.available():
             return [(f, os.path.splitext(os.path.basename(f))[0], pointclouds.provider_for_file(f)) for f in files]
         path = os.path.join(folder, 'mosaics', f'{name}_{postprocess.file_key(files)}.vpc')
-        changed = self.prepare_point_cloud(files, path)
-        if changed:
-            for layer in self.loaded_layers_for(path):
-                layer.setDataSource(path, layer.name(), 'vpc', False)
-                if layer.isValid():
-                    pointclouds.ensure_crs(layer)
-                    layer.triggerRepaint()
+        self.prepare_point_cloud(files, path)
         return [(path, name, 'vpc')]
 
     def prepare_point_cloud(self, files, path, cutline=None):
@@ -2237,7 +2231,16 @@ class LidarDownloader:
             raise finished['error']
         if finished['result'] is None:
             raise pointclouds.Cancelled('Point-cloud preparation cancelled.')
-        return finished['result'][0]
+        result = finished['result'][0]
+        if result:
+            for layer in self.loaded_layers_for(path):
+                layer.setDataSource(path, layer.name(), 'vpc', False)
+                if not layer.isValid():
+                    raise RuntimeError(f'Cannot refresh point cloud: {self.layer_open_error(layer)}')
+                pointclouds.ensure_crs(layer)
+                pointclouds.render_overview(layer)
+                layer.triggerRepaint()
+        return result
 
     def load_cropped_clouds(self, group_name, dataset, tiles, crop, outcome):
         """One exact polygon VPC per dataset, with no whole-cloud fallback on empty crops or errors."""

@@ -376,13 +376,13 @@ def write_las(path, tile, spacing=50):
                                 0b00001001, cls, 0, 0, 1))  # return 1 of 1
 
 
-def rendered_cloud_points(layer):
-    """Zoom inside the source bounds: VPCs normally show only extents when zoomed out."""
+def rendered_cloud_points(layer, scale=0.8):
+    """Render actual point colours, not the red VPC source outlines."""
     settings = QgsMapSettings()
     settings.setLayers([layer])
     settings.setDestinationCrs(layer.crs())
     extent = QgsRectangle(layer.extent())
-    extent.scale(0.8)
+    extent.scale(scale)
     settings.setExtent(extent)
     settings.setOutputSize(QSize(300, 300))
     settings.setBackgroundColor(QColor('white'))
@@ -391,8 +391,13 @@ def rendered_cloud_points(layer):
     job.waitForFinished()
     image = job.renderedImage()
     points = layer.dataProvider().identify(1000, QgsGeometry.fromRect(extent))
-    # The square building is at the centre; an extent-only layer leaves the centre white.
-    coloured = image.pixelColor(150, 150) != QColor('white')
+    if scale < 1:
+        coloured = image.pixelColor(150, 150) != QColor('white')
+    else:
+        point_colours = {category.color().name() for category in layer.renderer().categories()
+                         if category.value() in (2, 6)}
+        coloured = any(image.pixelColor(x, y).name() in point_colours
+                       for x in range(image.width()) for y in range(image.height()))
     return points, coloured, job.errors()
 
 
@@ -418,6 +423,7 @@ def check_virtual_point_cloud(plugin, tmp):
           "ordinary LAS sources produce a valid-looking VPC but no renderable points")
     QgsProject.instance().addMapLayer(layer)
     layer_id = layer.id()
+    layer.renderer().setPointSize(3)
     renderer = layer.renderer().clone()
     ticks = []
     timer = QTimer()
@@ -431,7 +437,8 @@ def check_virtual_point_cloud(plugin, tmp):
         print('VPC preparation errors:', outcome.unjoined, flush=True)
     timer.stop()
     check(ticks and outcome.loaded == {tile} and outcome.already == 1 and not outcome.unjoined
-          and QgsProject.instance().mapLayer(layer_id) is layer and layer.renderer().type() == renderer.type(),
+          and QgsProject.instance().mapLayer(layer_id) is layer and layer.renderer().type() == renderer.type()
+          and layer.renderer().pointSize() == renderer.pointSize(),
           "COPC preparation runs on a worker, keeps the UI responsive and refreshes the existing VPC layer")
     points, coloured, errors = rendered_cloud_points(layer)
     check(layer.crs().authid() == 'EPSG:27700' and points and coloured and not errors
@@ -441,6 +448,21 @@ def check_virtual_point_cloud(plugin, tmp):
         vpc = json.load(f)
     copies = [os.path.normpath(os.path.join(os.path.dirname(path), item['assets']['data']['href']))
               for item in vpc['features']]
+    overview_supported = hasattr(Qgis, 'PointCloudZoomOutRenderBehavior')
+    overviews = sorted({os.path.join(os.path.dirname(path), item['assets']['overview']['href'])
+                        for item in vpc['features']}) if overview_supported else []
+    if overview_supported:
+        check(layer.renderer().zoomOutBehavior() == Qgis.PointCloudZoomOutRenderBehavior.RenderOverview
+              and all(rendered_cloud_points(layer, scale)[1] for scale in (1.2, 3, 8)),
+              "upgraded VPC renders point colours at site and distant scales, not only source outlines")
+        check(overviews and all(os.path.isfile(f) for f in overviews)
+              and not list(Path(os.path.dirname(path)).glob('vpc_*')),
+              "overview references survive publication and temporary build folders are removed")
+        layer.renderer().setZoomOutBehavior(Qgis.PointCloudZoomOutRenderBehavior.RenderOverviewAndExtents)
+        mod.pointclouds.render_overview(layer)
+        check(layer.renderer().zoomOutBehavior() == Qgis.PointCloudZoomOutRenderBehavior.RenderOverviewAndExtents,
+              "an explicit overview-and-extents renderer choice is preserved")
+        layer.renderer().setZoomOutBehavior(Qgis.PointCloudZoomOutRenderBehavior.RenderOverview)
     for copy in copies:
         indexed = mod.pointclouds._layer(copy)
         check(copy.lower().endswith('.copc.laz') and indexed.dataProvider().hasValidIndex()
@@ -459,11 +481,12 @@ def check_virtual_point_cloud(plugin, tmp):
                if s['name'] == 'Z']
     check(len(z_stats) == 2 and all(s['minimum'] == 10.5 and s['maximum'] == 32.5 for s in z_stats),
           "PDAL calculates the expected height statistics by reading each indexed source")
-    times = [os.stat(f).st_mtime_ns for f in copies + [path]]
+    cache_files = copies + [path] + overviews
+    times = [os.stat(f).st_mtime_ns for f in cache_files]
     with mock.patch.object(mod.pointclouds, '_run', side_effect=AssertionError('cache should be reused')):
         check(not mod.pointclouds.ensure_vpc(files, path)
-              and times == [os.stat(f).st_mtime_ns for f in copies + [path]],
-              "repeated loading reuses COPC and VPC caches without running PDAL or rewriting files")
+              and times == [os.stat(f).st_mtime_ns for f in cache_files],
+              "repeated loading reuses COPC, VPC and overview caches without PDAL or rewriting files")
     for item in vpc['features']:
         item['assets']['data']['href'] = item['assets']['data']['href'].replace('/', '\\')
     with open(path, 'w', encoding='utf-8') as f:
@@ -485,6 +508,58 @@ def check_virtual_point_cloud(plugin, tmp):
     for loaded in plugin.loaded_layers_for(path):
         QgsProject.instance().removeMapLayer(loaded.id())
     loaded = None
+    if overview_supported:
+        legacy = json.loads(Path(path).read_text(encoding='utf-8'))
+        for item in legacy['features']:
+            item['assets'].pop('overview')
+        Path(path).write_text(json.dumps(legacy), encoding='utf-8')
+        copy_times = [os.stat(f).st_mtime_ns for f in copies]
+        check(mod.pointclouds.ensure_vpc(files, path)
+              and copy_times == [os.stat(f).st_mtime_ns for f in copies],
+              "existing VPC without an overview is upgraded without reindexing sources")
+        with open(path, encoding='utf-8') as f:
+            upgraded = json.load(f)
+        missing_overview = os.path.join(os.path.dirname(path), upgraded['features'][0]['assets']['overview']['href'])
+        os.remove(missing_overview)
+        check(mod.pointclouds.ensure_vpc(files, path),
+              "missing cached overview is regenerated")
+        with open(path, encoding='utf-8') as f:
+            regenerated = json.load(f)
+        corrupt_overview = os.path.join(
+            os.path.dirname(path), regenerated['features'][0]['assets']['overview']['href'])
+        Path(corrupt_overview).write_bytes(b'not a COPC file')
+        check(mod.pointclouds.ensure_vpc(files, path),
+              "unreadable cached overview is regenerated instead of reporting success")
+        # Force an upgrade while keeping the prior VPC intact on failure/cancellation.
+        for item in upgraded['features']:
+            item['assets'].pop('overview')
+        Path(path).write_text(json.dumps(upgraded), encoding='utf-8')
+        before = Path(path).read_bytes()
+        remaining = set(Path(os.path.dirname(path)).iterdir())
+
+        def interrupted_overview(algorithm, parameters, feedback=None, transform_context=None):
+            Path(parameters['OUTPUT']).write_text('{}', encoding='utf-8')
+            Path(parameters['OUTPUT'][:-4] + '-overview.copc.laz').write_bytes(b'incomplete')
+            raise mod.pointclouds.Cancelled('overview cancelled')
+
+        with mock.patch.object(mod.pointclouds, '_run', side_effect=interrupted_overview):
+            try:
+                mod.pointclouds.ensure_vpc(files, path)
+            except mod.pointclouds.Cancelled:
+                check(Path(path).read_bytes() == before and set(Path(os.path.dirname(path)).iterdir()) == remaining,
+                      "overview cancellation preserves prior VPC and removes partial overview files")
+            else:
+                check(False, "overview cancellation is reported")
+        with mock.patch.object(mod.pointclouds, '_run', side_effect=RuntimeError('overview build failed')):
+            try:
+                mod.pointclouds.ensure_vpc(files, path)
+            except RuntimeError as e:
+                check('overview build failed' in str(e) and Path(path).read_bytes() == before
+                      and set(Path(os.path.dirname(path)).iterdir()) == remaining,
+                      "overview failure is explicit and leaves no temporary files or replaced VPC")
+            else:
+                check(False, "overview failure is reported")
+        mod.pointclouds.ensure_vpc(files, path)
     changed_stat = os.stat(files[0])
     os.utime(files[0], ns=(changed_stat.st_atime_ns, changed_stat.st_mtime_ns + 1000000000))
     check(mod.pointclouds.ensure_vpc(files, path)
@@ -1973,6 +2048,22 @@ def main():
                   and cropped_clouds[0].providerType() == 'vpc'
                   and msgs and "Cropped to 'patch'" in msgs[-1][0],
                   "Load crop on point clouds uses only selected polygon features and exact retained points")
+            if hasattr(Qgis, 'PointCloudZoomOutRenderBehavior') and cropped_clouds:
+                cropped = cropped_clouds[0]
+                cropped_id = cropped.id()
+                cropped.renderer().setPointSize(3)
+                cropped.renderer().setZoomOutBehavior(Qgis.PointCloudZoomOutRenderBehavior.RenderExtents)
+                crop_vpc = json.loads(Path(cropped.source()).read_text(encoding='utf-8'))
+                for item in crop_vpc['features']:
+                    item['assets'].pop('overview')
+                Path(cropped.source()).write_text(json.dumps(crop_vpc), encoding='utf-8')
+                select('SU12NE')
+                plugin.load_selected_tiles()
+                check(QgsProject.instance().mapLayer(cropped_id) is cropped
+                      and cropped.renderer().pointSize() == 3
+                      and cropped.renderer().zoomOutBehavior() == Qgis.PointCloudZoomOutRenderBehavior.RenderOverview
+                      and all(rendered_cloud_points(cropped, scale)[1] for scale in (1.2, 3, 8)),
+                      "already loaded polygon crop upgrades to wide-scale dots without replacing its style or layer")
             check(dock.btnLoadSelected.text() == 'Load crop'
                   and dock.cboAfterDownload.itemText(dock.cboAfterDownload.findData('tiles')) == 'Load the crop',
                   "point clouds expose crop loading consistently in manual and after-download controls")

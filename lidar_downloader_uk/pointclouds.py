@@ -11,9 +11,10 @@ system recorded, so the VPC is given British National Grid.
 import json
 import os
 import shutil
+import tempfile
 from collections import deque
 
-from qgis.core import (QgsApplication, QgsBlockingProcess, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+from qgis.core import (Qgis, QgsApplication, QgsBlockingProcess, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
                        QgsGeometry, QgsJsonUtils, QgsPointXY, QgsPointCloudClassifiedRenderer, QgsPointCloudLayer,
                        QgsProcessingContext,
                        QgsProcessingException, QgsProcessingFeedback, QgsProcessingMultiStepFeedback,
@@ -428,7 +429,9 @@ def ensure_vpc(files, output, feedback=None, transform_context=None):
         _check_cancelled(feedback)
         indexed.append(_ensure_copc(source, copc_path(source, folder), steps, transform_context))
     steps.setCurrentStep(len(files))
-    feedback.setProgressText('Building virtual point cloud...')
+    overview = hasattr(Qgis, 'PointCloudZoomOutRenderBehavior')
+    feedback.setProgressText('Building virtual point cloud and zoomed-out overview...' if overview
+                             else 'Building virtual point cloud...')
     if os.path.exists(output):
         with open(output, encoding='utf-8') as f:
             data = json.load(f)
@@ -436,25 +439,80 @@ def ensure_vpc(files, output, feedback=None, transform_context=None):
                       for item in data.get('features', [])]
         resolved = sorted(os.path.normcase(os.path.abspath(os.path.join(
             os.path.dirname(output), ref.replace('\\', '/')))) for ref in references)
-        if resolved == sorted(os.path.normcase(os.path.abspath(path)) for path in indexed):
+        overview_paths = {os.path.abspath(os.path.join(
+            os.path.dirname(output), item.get('assets', {}).get('overview', {}).get('href', '').replace('\\', '/')))
+            for item in data.get('features', [])}
+        has_overview = bool(overview_paths)
+        if overview:
+            for path in overview_paths:
+                if not os.path.isfile(path):
+                    has_overview = False
+                    break
+                try:
+                    cached = _layer(path)
+                    valid = cached.pointCount() > 0 and cached.dataProvider().hasValidIndex()
+                except RuntimeError as e:
+                    feedback.pushInfo(f'Rebuilding unreadable point-cloud overview: {path}\n{e}')
+                    valid = False
+                cached = None
+                if not valid:
+                    has_overview = False
+                    break
+        if (resolved == sorted(os.path.normcase(os.path.abspath(path)) for path in indexed)
+                and (not overview or has_overview)):
             changed = fix_vpc_crs(output, transform_context)
             feedback.setProgress(100)
             return changed
         feedback.pushInfo(f'Rebuilding VPC over indexed point clouds: {output}')
-    part = output[:-4] + '_part.vpc'
     layers = [_layer(path) for path in indexed]
+    published_overviews = []
+    published = False
     try:
-        if os.path.exists(part):
-            os.remove(part)
-        parameters = {'LAYERS': layers, 'BOUNDARY': False, 'STATISTICS': False,
-                      'OVERVIEW': False, 'OUTPUT': part}
-        _run('pdal:virtualpointcloud', parameters, steps, transform_context)
-        fix_vpc_crs(part, transform_context)
-        _check_cancelled(feedback)
-        os.replace(part, output)
+        with tempfile.TemporaryDirectory(prefix='vpc_', dir=os.path.dirname(output)) as staging:
+            part = os.path.join(staging, os.path.basename(output))
+            parameters = {'LAYERS': layers, 'BOUNDARY': False, 'STATISTICS': False,
+                          'OVERVIEW': overview, 'OUTPUT': part}
+            _run('pdal:virtualpointcloud', parameters, steps, transform_context)
+            fix_vpc_crs(part, transform_context)
+            with open(part, encoding='utf-8') as f:
+                data = json.load(f)
+            if len(data.get('features', [])) != len(indexed):
+                raise RuntimeError(f'Virtual point cloud did not include all {len(indexed)} sources: {output}')
+            moved = {}
+            for item in data.get('features', []):
+                if not item.get('assets', {}).get('data', {}).get('href'):
+                    raise RuntimeError(f'Virtual point cloud has no source reference: {output}')
+                if overview and not item.get('assets', {}).get('overview', {}).get('href'):
+                    raise RuntimeError(f'Virtual point cloud has no zoomed-out overview: {output}')
+                for name, asset in item.get('assets', {}).items():
+                    source = os.path.abspath(os.path.join(staging, asset['href'].replace('\\', '/')))
+                    if name == 'overview' and source not in moved:
+                        indexed_overview = _layer(source)
+                        valid = indexed_overview.dataProvider().hasValidIndex() and indexed_overview.pointCount() > 0
+                        indexed_overview = None
+                        if not valid:
+                            raise RuntimeError(f'Unreadable zoomed-out overview: {source}')
+                        target = (output[:-4] + '_' + os.path.basename(staging)
+                                  + f'_{len(moved)}-overview.copc.laz')
+                        _check_cancelled(feedback)
+                        os.replace(source, target)
+                        published_overviews.append(target)
+                        moved[source] = target
+                    target = moved.get(source, source)
+                    try:
+                        target = './' + os.path.relpath(target, os.path.dirname(os.path.abspath(output)))
+                    except ValueError:
+                        pass  # Different Windows drives require an absolute asset path.
+                    asset['href'] = target.replace('\\', '/')
+            with open(part, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=1)
+            _check_cancelled(feedback)
+            os.replace(part, output)
+            published = True
     finally:
-        if os.path.exists(part):
-            os.remove(part)
+        if not published:
+            for path in published_overviews:
+                os.remove(path)
     feedback.setProgress(100)
     return True
 
@@ -468,12 +526,22 @@ def build_vpc(files, output, feedback=None, transform_context=None):
 def style_classified(layer):
     """Colour points by their classification (ground, vegetation, buildings, water...)."""
     names = [a.name() for a in layer.attributes().attributes()] if layer.attributes() else []
-    if 'Classification' not in names:
-        return
-    renderer = QgsPointCloudClassifiedRenderer('Classification', QgsPointCloudClassifiedRenderer.defaultCategories())
-    renderer.setPointSize(2)
-    layer.setRenderer(renderer)
+    if 'Classification' in names:
+        renderer = QgsPointCloudClassifiedRenderer(
+            'Classification', QgsPointCloudClassifiedRenderer.defaultCategories())
+        renderer.setPointSize(2)
+        layer.setRenderer(renderer)
+    render_overview(layer)
     layer.triggerRepaint()
+
+
+def render_overview(layer):
+    """Use a VPC's overview at wide scales without replacing the user's point styling (QGIS 3.42+)."""
+    modes = getattr(Qgis, 'PointCloudZoomOutRenderBehavior', None)
+    renderer = layer.renderer()
+    if (layer.providerType() == 'vpc' and modes is not None and renderer is not None
+            and hasattr(renderer, 'setZoomOutBehavior') and renderer.zoomOutBehavior() == modes.RenderExtents):
+        renderer.setZoomOutBehavior(modes.RenderOverview)
 
 
 def ensure_crs(layer):

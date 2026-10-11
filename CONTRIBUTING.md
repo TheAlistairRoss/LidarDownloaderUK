@@ -58,6 +58,9 @@ reproduce a valid-looking but unrenderable VPC over ordinary LAS files, then ver
 point rendering and identification, preservation of the originals, cache reuse/invalidation, Windows path
 repair, existing-layer refresh, worker progress/cancellation and diagnostic failures. These checks do not
 just assert that a VPC exists or `isValid()` returns true. Point clouds are skipped when PDAL is unavailable.
+On QGIS 3.42+, they also check actual point colours at three zoomed-out scales, persisted overview
+references, overview cache reuse/missing-file regeneration, legacy VPC upgrades and failure/cancellation
+cleanup. Older QGIS versions keep their existing rendering path.
 
 For a Windows manual regression, use QGIS 3.44.13, England point cloud (individual surveys), 2024, tile
 SJ90SE. Load the existing downloads with the updated plugin, wait for COPC preparation, and zoom inside
@@ -65,6 +68,8 @@ one source file's extent. Check that classified points appear and can be identif
 EPSG:27700, and there are no source-open warnings in Log Messages. Remove and load the layer again:
 the indexed copies should be reused. Save/reopen the project to check persisted VPC references. Keep
 the VPC's `mosaics/pointcloud_indexes/` folder; the original LAZ files are not modified by preparation.
+Zoom out to the site and beyond: on QGIS 3.42+ dots should remain visible, not only red file outlines.
+Repeat with a polygon crop and keep the companion `*-overview.copc.laz` file alongside the VPC.
 Record the plugin installation path as well as its version to distinguish a local fix from a release
 with the same version number.
 
