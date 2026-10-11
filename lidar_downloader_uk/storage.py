@@ -136,8 +136,12 @@ def find_raster_files(download_dir, tile):
 
 
 def find_point_cloud_files(download_dir, tile):
-    """Return point cloud files (.laz/.las) extracted for a tile."""
-    return _find(download_dir, tile, POINT_CLOUD_PATTERNS)
+    """Point clouds extracted for a tile, without counting QGIS's sibling COPC indexes twice."""
+    files = _find(download_dir, tile, POINT_CLOUD_PATTERNS)
+    originals = {os.path.normcase(os.path.splitext(path)[0]) for path in files
+                 if not path.lower().endswith('.copc.laz')}
+    return [path for path in files if not path.lower().endswith('.copc.laz')
+            or os.path.normcase(path[:-len('.copc.laz')]) not in originals]
 
 
 def find_photo_files(download_dir, tile):

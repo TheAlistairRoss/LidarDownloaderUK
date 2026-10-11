@@ -60,6 +60,15 @@ def test_extract_and_find_rasters(tmp_path):
     assert storage.find_raster_files(d, 'TQ09SW') == []
 
 
+def test_point_clouds_do_not_duplicate_qgis_copc_sidecars(tmp_path):
+    folder = str(tmp_path)
+    for name in ('a.laz', 'a.copc.laz', 'sub\\b.las', 'sub\\b.copc.laz', 'standalone.copc.laz'):
+        touch(os.path.join(folder, 'SJ90SE', name.replace('\\', os.sep)))
+    found = storage.find_point_cloud_files(folder, 'SJ90SE')
+    assert sorted(os.path.basename(path) for path in found) == ['a.laz', 'b.las', 'standalone.copc.laz']
+    assert len(storage.find_data_files(folder, 'SJ90SE')) == 5
+
+
 def test_grids_without_prj_get_british_national_grid(tmp_path):
     d = str(tmp_path)
     make_zip(storage.zip_path(d, 'TQ16NW'), {

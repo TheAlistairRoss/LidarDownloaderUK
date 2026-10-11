@@ -15,12 +15,13 @@ import json
 import math
 import os
 
-from qgis.PyQt.QtCore import QSettings, QTimer, Qt, QStandardPaths, QUrl
+from qgis.PyQt.QtCore import QEventLoop, QSettings, QTimer, Qt, QStandardPaths, QUrl, pyqtSignal, pyqtSlot
 from qgis.PyQt.QtGui import QDesktopServices, QIcon
-from qgis.PyQt.QtWidgets import QAction, QActionGroup, QMenu, QMessageBox, QFileDialog, QPushButton
+from qgis.PyQt.QtWidgets import QAction, QActionGroup, QMenu, QMessageBox, QFileDialog, QProgressDialog, QPushButton
 from qgis.core import (
     Qgis, QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsField,
-    QgsGeometry, QgsMarkerSymbol, QgsMessageLog, QgsPointCloudLayer, QgsPointXY, QgsProcessingUtils, QgsProject,
+    QgsGeometry, QgsMarkerSymbol, QgsMessageLog, QgsPointCloudLayer, QgsPointXY, QgsProcessingFeedback,
+    QgsProcessingUtils, QgsProject,
     QgsProperty, QgsRasterLayer, QgsRasterTransparency, QgsRectangle, QgsSingleSymbolRenderer, QgsTask,
     QgsVectorLayer)
 
@@ -103,6 +104,27 @@ class LoadOutcome:
         self.cropped = False  # a layer cropped to the area was added (or was there already)
         self.missed = False   # the "Crop to" area missed the tiles: they loaded as downloaded
         self.clouds = False   # point clouds were loaded (they always load whole)
+        self.cancelled = False
+
+
+class PointCloudFeedback(QgsProcessingFeedback):
+    textChanged = pyqtSignal(str)
+
+    def setProgressText(self, text):
+        super().setProgressText(text)
+        self.textChanged.emit(text)
+
+
+class PointCloudProgress(QProgressDialog):
+    @pyqtSlot(float)
+    def set_progress(self, value):
+        self.setValue(int(value))
+
+    @pyqtSlot()
+    def show_cancelling(self):
+        self.setLabelText("Cancelling point-cloud preparation...")
+        self.setCancelButton(None)
+        self.show()
 
 
 def choose_place(parent, labels):
@@ -1270,14 +1292,16 @@ class LidarDownloader:
         selected tiles that make a square or rectangle (so it has no empty space), of data that can be joined (not
         point clouds or oblique photos). When it can't be used the tiles are loaded individually instead; it's
         chosen again when it can."""
-        joinable = api.product_kind(self.dataset.product) in (api.RASTER, api.IMAGERY)
-        crop = joinable and self.crop_tiles is not None  # loading gives the crop: the only way to load
+        kind = api.product_kind(self.dataset.product)
+        joinable = kind in (api.RASTER, api.IMAGERY)
+        crop = kind in (api.RASTER, api.IMAGERY, api.POINT_CLOUD) and self.crop_tiles is not None
         possible = joinable and not crop and places.fills_rectangle(tiles)
         combo = self.dock.cboAfterDownload
         tiles_row, mosaic_row = combo.findData('tiles'), combo.findData('mosaic')
         combo.setItemText(tiles_row, "Load the crop" if crop else "Load each tile")
-        combo.setItemData(tiles_row, "When the download finishes, add your area as one layer: the tiles under the "
-                          "crop joined and cut to its shape (the tiles themselves are downloaded whole)" if crop
+        combo.setItemData(tiles_row, "When the download finishes, load your polygon crop as one layer. "
+                          "Point clouds are clipped before only retained points are indexed; rasters and imagery "
+                          "are joined and cropped (the tiles themselves are downloaded whole)." if crop
                           else self.tiles_tooltip, Qt.ItemDataRole.ToolTipRole)
         combo.view().setRowHidden(mosaic_row, crop)
         combo.model().item(mosaic_row).setEnabled(possible)
@@ -1294,7 +1318,7 @@ class LidarDownloader:
     def update_use_buttons(self, downloaded=()):
         """Step 4's buttons act on the selected tiles that are downloaded (of the chosen dataset), so they're greyed
         out when there are none, or while a download or a mosaic is being made. Create mosaic isn't for point clouds or
-        oblique photos (they're only ever loaded as downloaded). Survey dates is only for products that come with
+        oblique photos (point clouds crop through Load crop instead). Survey dates is only for products that come with
         them, and shows as on while the survey dates of any of the selected tiles are shown."""
         if self.dock is None:
             return
@@ -1302,7 +1326,7 @@ class LidarDownloader:
         kind = api.product_kind(self.dataset.product)
         self.dock.btnLoadSelected.setEnabled(bool(downloaded) and not busy)
         self.dock.btnLoadSelected.setText("Load crop" if self.crop_tiles is not None
-                                          and kind in (api.RASTER, api.IMAGERY) else "Load selected")
+                                          and kind in (api.RASTER, api.IMAGERY, api.POINT_CLOUD) else "Load selected")
         self.dock.btnCreateVRT.setEnabled(bool(downloaded) and kind not in (api.PHOTOS, api.POINT_CLOUD) and not busy
                                           and self.post_task is None)
         dated = list(downloaded) if api.has_survey_dates(self.dataset.product) else []
@@ -2049,13 +2073,15 @@ class LidarDownloader:
         """Add tiles to the project, one layer per 5 km tile, in their dataset's group (see load_files): the files
         are only read, never changed. "Create mosaic..." joins tiles; so does "Crop to": with it ticked, rasters
         and imagery load as one layer of the area, the tiles under it made into a mosaic cropped to its shape.
+        Point clouds are clipped to the exact polygons before only the retained points are indexed.
         Elevation layers in a group are drawn on one colour scale, so neighbouring tiles match at their edges;
         oblique photos load as points. note is added to the message. Returns what it did (a LoadOutcome), or None if
         the user cancelled."""
         if not self.offer_metres(tile_names):
             return None
         crop, crop_note = None, ''
-        if self.dock.chkCrop.isChecked() and api.product_kind(self.dataset.product) in (api.RASTER, api.IMAGERY):
+        crop_requested = self.dock.chkCrop.isChecked()
+        if crop_requested and api.product_kind(self.dataset.product) in (api.RASTER, api.IMAGERY, api.POINT_CLOUD):
             crop = self.crop_cutline(quiet=True)
             if crop is None:  # never stop loading over it: load as downloaded and say why
                 layer = self.dock.cboLayer.currentLayer()
@@ -2077,9 +2103,18 @@ class LidarDownloader:
         outcome = LoadOutcome()
         for group_name, (dataset, tiles) in by_group.items():
             kind = api.product_kind(dataset.product)
-            if crop is None or kind not in (api.RASTER, api.IMAGERY) \
+            if kind == api.POINT_CLOUD and crop_requested:
+                if crop is None:
+                    outcome.problems.append(f"{group_name}: No valid polygon to crop point clouds to; "
+                                            "nothing loaded. Choose a polygon layer beside Crop to.")
+                    crop_note = ''
+                else:
+                    self.load_cropped_clouds(group_name, dataset, tiles, crop, outcome)
+            elif crop is None or kind not in (api.RASTER, api.IMAGERY) \
                     or not self.load_cropped(group_name, dataset, kind, tiles, crop, outcome):
                 self.load_files(group_name, dataset, kind, tiles, outcome)
+            if outcome.cancelled:
+                break
             group = QgsProject.instance().layerTreeRoot().findGroup(group_name)
             if group is not None and kind == api.RASTER and api.is_elevation(dataset.product):
                 self.fit_group_colours(group)
@@ -2102,6 +2137,10 @@ class LidarDownloader:
                 if clouds:
                     outcome.clouds = True
                     sources += self.tile_cloud_sources(tile, folder, clouds)
+            except pointclouds.Cancelled as e:
+                outcome.cancelled = True
+                outcome.unjoined.append(f"{tile}: {e}")
+                break
             except Exception as e:  # files that couldn't be joined: say so, and carry on with the other tiles
                 outcome.unjoined.append(f"{tile}: {e}")
             if photos:
@@ -2109,9 +2148,13 @@ class LidarDownloader:
             for path, name, provider in sources:
                 key = os.path.normcase(path)
                 if key not in done:
-                    if self.loaded_layer_for(path) is not None:  # (checked before opening: point clouds are slow)
-                        outcome.already += 1
-                        done[key] = True
+                    existing = self.loaded_layer_for(path)
+                    if existing is not None:  # (checked before opening: point clouds are slow)
+                        done[key] = existing.isValid()
+                        if done[key]:
+                            outcome.already += 1
+                        else:
+                            outcome.failed.append(self.layer_open_error(existing))
                     else:
                         if provider == 'gdal':
                             layer = QgsRasterLayer(path, name)
@@ -2133,22 +2176,99 @@ class LidarDownloader:
         return postprocess.tile_vrt(files, os.path.join(folder, 'mosaics'), tile,
                                     places.parse_grid_reference(tile).extent, black_is_data)
 
-    @staticmethod
-    def tile_cloud_sources(tile, folder, files):
+    def tile_cloud_sources(self, tile, folder, files):
         """[(path, layer name, provider)] for a tile's point clouds: its file, or a virtual point cloud joining its
         files (QGIS 3.32+ with PDAL; without, each file, named after it). A 10 km square's file is named after the
         square: point clouds can't be trimmed to the tile without being copied."""
         own = os.path.normcase(storage.extract_path(folder, tile)) + os.sep
         name = tile if any(os.path.normcase(f).startswith(own) for f in files) else tile[:4]
         if len(files) == 1:
-            return [(files[0], name, 'pdal')]
+            return [(files[0], name, pointclouds.provider_for_file(files[0]))]
         if not pointclouds.available():
-            return [(f, os.path.splitext(os.path.basename(f))[0], 'pdal') for f in files]
+            return [(f, os.path.splitext(os.path.basename(f))[0], pointclouds.provider_for_file(f)) for f in files]
         path = os.path.join(folder, 'mosaics', f'{name}_{postprocess.file_key(files)}.vpc')
-        if not os.path.exists(path):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            pointclouds.build_vpc(files, path)
+        changed = self.prepare_point_cloud(files, path)
+        if changed:
+            for layer in self.loaded_layers_for(path):
+                layer.setDataSource(path, layer.name(), 'vpc', False)
+                if layer.isValid():
+                    pointclouds.ensure_crs(layer)
+                    layer.triggerRepaint()
         return [(path, name, 'vpc')]
+
+    def prepare_point_cloud(self, files, path, cutline=None):
+        """Prepare indexes on a worker, with a modal progress/cancel dialog keeping the UI responsive."""
+        feedback = PointCloudFeedback()
+        transform_context = QgsProject.instance().transformContext()
+        dialog = PointCloudProgress(
+            ("Checking file bounds, then cropping to polygon and indexing only retained points."
+             if cutline is not None else
+             "Preparing point clouds. First load creates COPC copies and needs additional disk space."),
+            "Cancel", 0, 100, self.dock)
+        dialog.setWindowTitle("Prepare Point Cloud")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        feedback.progressChanged.connect(dialog.set_progress)
+        feedback.textChanged.connect(dialog.setLabelText)
+        dialog.canceled.connect(feedback.cancel)
+        dialog.canceled.connect(dialog.show_cancelling)
+        loop, finished = QEventLoop(), {}
+
+        def work(task):
+            result = (pointclouds.build_cropped_vpc(files, path, cutline, feedback, transform_context)
+                      if cutline is not None else pointclouds.ensure_vpc(files, path, feedback, transform_context))
+            return (result,)
+
+        def done(exception, result=None):
+            finished.update(error=exception, result=result)
+            loop.quit()
+
+        task = QgsTask.fromFunction("LIDAR Downloader UK: prepare point cloud", work, on_finished=done)
+        QgsApplication.taskManager().addTask(task)
+        dialog.show()
+        try:
+            loop.exec()
+        finally:
+            dialog.canceled.disconnect()
+            dialog.close()
+            dialog.deleteLater()
+        if finished['error'] is not None:
+            raise finished['error']
+        if finished['result'] is None:
+            raise pointclouds.Cancelled('Point-cloud preparation cancelled.')
+        return finished['result'][0]
+
+    def load_cropped_clouds(self, group_name, dataset, tiles, crop, outcome):
+        """One exact polygon VPC per dataset, with no whole-cloud fallback on empty crops or errors."""
+        area, cutline = crop
+        files = list(dict.fromkeys(f for tile in sorted(tiles) for f in tiles[tile][2]))
+        outcome.clouds = True
+        if not files:
+            outcome.problems.append(f"{group_name}: No point-cloud files to crop.")
+            return
+        try:
+            folder = os.path.join(tiles[sorted(tiles)[0]][0], 'mosaics')
+            path = pointclouds.crop_path(files, folder, cutline)
+            contributors = set(self.prepare_point_cloud(files, path, cutline))
+        except pointclouds.Cancelled as e:
+            outcome.cancelled = True
+            outcome.unjoined.append(f"{group_name}: {e}")
+            return
+        except Exception as e:
+            outcome.problems.append(f"{group_name}: {e} Nothing loaded; original clouds were not substituted.")
+            return
+        under = {tile for tile in tiles if contributors.intersection(tiles[tile][2])}
+        outcome.outside += [tile for tile in sorted(tiles) if tile not in under]
+        outcome.cropped = True
+        if self.loaded_layer_for(path) is not None:
+            outcome.already += 1
+            outcome.loaded.update(under)
+            return
+        name = f"{group_name} ({plural(len(under), 'tile')}, cropped to {area})"
+        layer = QgsPointCloudLayer(path, name, 'vpc')
+        if self.add_layer(layer, self.layer_group(group_name), dataset, api.POINT_CLOUD, outcome):
+            outcome.loaded.update(under)
 
     def load_cropped(self, group_name, dataset, kind, tiles, crop, outcome):
         """With "Crop to" ticked: the tiles under the area (crop: (its name, GeoJSON)) as one layer, their files made
@@ -2185,7 +2305,7 @@ class LidarDownloader:
         drawn: the file isn't changed). Elevation is coloured afterwards, with its group (fit_group_colours).
         Returns True if it was added (False if QGIS couldn't open it)."""
         if not layer.isValid():
-            outcome.failed.append(f"{layer.name()}: {layer.source().split('|')[0]}")
+            outcome.failed.append(self.layer_open_error(layer))
             return False
         elevation = kind == api.RASTER and api.is_elevation(dataset.product)
         if isinstance(layer, QgsPointCloudLayer):
@@ -2200,6 +2320,12 @@ class LidarDownloader:
         parent.addLayer(layer)
         outcome.added += 1
         return True
+
+    @staticmethod
+    def layer_open_error(layer):
+        error = layer.error().summary()
+        return (f"{layer.name()} ({layer.providerType()}): {layer.source().split('|')[0]}"
+                + (f"\n{error}" if error else ''))
 
     def fit_group_colours(self, group):
         """Draw a group's elevation layers on one colour scale, from the lowest to the highest height among them, so
@@ -2253,18 +2379,18 @@ class LidarDownloader:
             text += f" {crop_note}"
         if note:
             text += f" {note}"
-        if outcome.clouds and self.dock.chkCrop.isChecked():
-            text += " Point clouds load whole: use 'Create mosaic...' to save a cropped copy."
         if outcome.already:
             text += f" {outcome.already} already in the project."
+        if outcome.cancelled:
+            text += " Point-cloud preparation cancelled."
         if outcome.problems:
             self.notify(f"{text} Couldn't crop {plural(len(outcome.problems), 'dataset')}.",
                         Qgis.MessageLevel.Warning, "\n".join(outcome.problems))
         elif outcome.unjoined or outcome.failed:
             parts = []
             if outcome.unjoined:
-                parts.append(f"{plural(len(outcome.unjoined), 'tile')} couldn't be loaded: GDAL couldn't join "
-                             f"{'its' if len(outcome.unjoined) == 1 else 'their'} files.")
+                parts.append(f"{plural(len(outcome.unjoined), 'tile')} couldn't be loaded: "
+                             "preparing the files failed.")
             if outcome.failed:
                 parts.append(f"{plural(len(outcome.failed), 'layer')} couldn't be opened.")
             self.notify(f"{text} {' '.join(parts)} (Point clouds need QGIS's PDAL support, ECW imagery needs "
@@ -2327,7 +2453,7 @@ class LidarDownloader:
     def create_mosaic_from_selected(self):
         """Save the selected tiles of the chosen dataset (rasters or imagery) as one file: a VRT (reads the tiles) or
         a GeoTIFF copy, cropped to the chosen layer when "Crop to" is ticked. Point clouds and oblique photos are only
-        ever loaded as downloaded."""
+        handled by Load selected, including polygon cropping for point clouds."""
         if self.post_task is not None:
             self.notify("Wait for the current mosaic to finish.", Qgis.MessageLevel.Info)
             return
@@ -2340,8 +2466,9 @@ class LidarDownloader:
                         Qgis.MessageLevel.Warning)
             return
         if kind == api.POINT_CLOUD:
-            self.notify("Point clouds aren't joined into a mosaic or cropped: use 'Load selected' to load them as "
-                        "downloaded.", Qgis.MessageLevel.Warning)
+            self.notify("Point clouds aren't joined into a raster mosaic: use 'Load selected' (or 'Load crop' "
+                        "with Crop to ticked) to load them. Polygon crops index only retained points.",
+                        Qgis.MessageLevel.Warning)
             return
         crop = None
         if self.dock.chkCrop.isChecked():

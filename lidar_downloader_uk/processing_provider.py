@@ -16,7 +16,7 @@ from qgis.core import (
     QgsProcessingParameterFileDestination, QgsProcessingParameterFolderDestination, QgsProcessingParameterString,
     QgsProcessingProvider)
 
-from . import api, postprocess, storage
+from . import api, pointclouds, postprocess, storage
 from .grid import intersecting_features, open_grid, search_areas
 from .tasks import DownloadTilesTask, SearchTask
 
@@ -79,6 +79,7 @@ class DownloadTilesAlgorithm(QgsProcessingAlgorithm):
     OUTPUT_VRT = 'OUTPUT_VRT'
     CROP_VRT = 'CROP_VRT'
     OUTPUT_CLIPPED = 'OUTPUT_CLIPPED'
+    OUTPUT_CLOUD = 'OUTPUT_CLOUD'
     DOWNLOADED = 'DOWNLOADED'
     FAILED = 'FAILED'
     UNAVAILABLE = 'UNAVAILABLE'
@@ -117,7 +118,12 @@ class DownloadTilesAlgorithm(QgsProcessingAlgorithm):
             'Raster and imagery datasets can be combined into a VRT mosaic (a small file that reads the tiles), '
             'which is loaded when the algorithm finishes. Tick "Crop the VRT" to crop it to the input layer\'s '
             'polygons: download and crop in one go. Optionally, also save the tiles clipped to the input layer\'s '
-            'polygons as a standalone GeoTIFF copy (Cloud-Optimised).')
+            'polygons as a standalone GeoTIFF copy (Cloud-Optimised).\n\n'
+            'For point-cloud products, optionally choose "Point clouds cropped to the input layer (VPC)". '
+            'File bounds are checked first; intersecting LAS/LAZ files are clipped to the exact polygons '
+            '(including holes), then only retained points are indexed as cached COPC files beside the VPC. '
+            'The VPC reads these copies: keep them with it. Empty crops warn and load nothing. '
+            'Original downloads remain unchanged; an input polygon layer is required, not just an extent.')
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterFeatureSource(
@@ -153,6 +159,9 @@ class DownloadTilesAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFileDestination(
             self.OUTPUT_CLIPPED, self.tr('Clipped to the input layer (GeoTIFF copy)'), fileFilter='GeoTIFF (*.tif)',
             optional=True, createByDefault=False))
+        self.addParameter(QgsProcessingParameterFileDestination(
+            self.OUTPUT_CLOUD, self.tr('Point clouds cropped to the input layer (VPC)'),
+            fileFilter='Virtual point clouds (*.vpc)', optional=True, createByDefault=False))
         self.addOutput(QgsProcessingOutputFolder(self.FOLDER, self.tr('Dataset folder')))
         self.addOutput(QgsProcessingOutputNumber(self.DOWNLOADED, self.tr('Tiles downloaded or reused')))
         self.addOutput(QgsProcessingOutputNumber(self.FAILED, self.tr('Tiles that failed')))
@@ -217,6 +226,10 @@ class DownloadTilesAlgorithm(QgsProcessingAlgorithm):
             results[self.OUTPUT_VRT] = self._build_vrt(parameters, context, feedback, dataset_dir, files,
                                                        folder_dataset)
         results[self.OUTPUT_CLIPPED] = self._clip(parameters, context, feedback, files, folder_dataset)
+        cloud_files = list(dict.fromkeys(
+            path for tile in succeeded for path in storage.find_point_cloud_files(folders[tile], tile)))
+        results[self.OUTPUT_CLOUD] = self._crop_clouds(
+            parameters, context, feedback, cloud_files, folder_dataset)
         return results
 
     def _wanted_dataset(self, parameters, context):
@@ -313,6 +326,29 @@ class DownloadTilesAlgorithm(QgsProcessingAlgorithm):
             postprocess.release(mosaic)
         self._load_on_completion(context, clipped_path, f'{api.dataset_label(dataset)} clipped', self.OUTPUT_CLIPPED)
         return clipped_path
+
+    def _crop_clouds(self, parameters, context, feedback, files, dataset):
+        output = self.parameterAsFileOutput(parameters, self.OUTPUT_CLOUD, context)
+        if not output:
+            return None
+        if api.product_kind(dataset.product) != api.POINT_CLOUD or not files:
+            feedback.pushWarning(self.tr('No cropped point clouds: it needs downloaded LAS/LAZ files.'))
+            return None
+        cutline = self._cutline(parameters, context, None)  # BNG, not a raster CRS
+        if cutline is None:
+            feedback.pushWarning(self.tr('No cropped point clouds: the input layer has no polygons.'))
+            return None
+        try:
+            pointclouds.build_cropped_vpc(files, output, cutline, feedback, context.transformContext())
+        except pointclouds.EmptyCrop as e:
+            feedback.pushWarning(str(e))
+            return None
+        except pointclouds.Cancelled:
+            return None
+        except RuntimeError as e:
+            raise QgsProcessingException(self.tr('Could not crop point clouds: {}').format(e)) from e
+        self._load_on_completion(context, output, f'{api.dataset_label(dataset)} cropped', self.OUTPUT_CLOUD)
+        return output
 
     @staticmethod
     def _progress(feedback):

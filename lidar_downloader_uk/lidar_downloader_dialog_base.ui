@@ -106,7 +106,7 @@
             <string>Crop to</string>
            </property>
            <property name="toolTip">
-            <string>Load, and save mosaics, cut to the polygons of the layer chosen beside it (its selected features if it has any), such as a site boundary: the tiles under it are joined into a mosaic and cropped to its shape. Ticking it selects the tiles beneath the layer.</string>
+            <string>Load rasters, imagery and point clouds cut to the polygons of the layer chosen beside it (its selected features if it has any), including holes and separate sites. Point-cloud file bounds are checked before clipping; only cropped points are indexed. Raster mosaics you save are also cropped. Downloads remain unchanged. Ticking it selects the tiles beneath the layer.</string>
            </property>
           </widget>
          </item>
@@ -275,7 +275,7 @@
             <string>Create mosaic...</string>
            </property>
            <property name="toolTip">
-            <string>Join the selected tiles into one mosaic, cropped when "Crop to" is ticked: a temporary one, gone when QGIS closes, or saved as a VRT (a small file that reads the tiles) or a GeoTIFF copy. Not for point clouds or oblique photos: they load as downloaded.</string>
+            <string>Join the selected tiles into one raster mosaic, cropped when "Crop to" is ticked: a temporary one, gone when QGIS closes, or saved as a VRT (a small file that reads the tiles) or a GeoTIFF copy. For point clouds use Load selected / Load crop instead; oblique photos load as downloaded.</string>
            </property>
           </widget>
          </item>

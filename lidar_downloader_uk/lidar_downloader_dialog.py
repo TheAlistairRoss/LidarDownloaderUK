@@ -85,7 +85,9 @@ class LidarDownloaderDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
         self.cboLayer = QgsMapLayerComboBox(self)
         self.cboLayer.setFilters(_polygon_layers())
         self.cboLayer.setToolTip("The polygon layer to crop to (its selected features if it has any): ticking "
-                                 "'Crop to' selects the tiles beneath it")
+                                 "'Crop to' selects the tiles beneath it. Loading crops rasters, imagery and "
+                                 "point clouds; point clouds are clipped before only retained points are indexed. "
+                                 "Downloads remain unchanged.")
         self.layCrop.addWidget(self.cboLayer, 1)
 
         # The sections fold up (QGIS's own group boxes), each remembering whether it was folded

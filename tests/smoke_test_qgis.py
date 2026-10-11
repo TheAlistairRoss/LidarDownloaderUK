@@ -18,6 +18,7 @@ import tempfile
 import time
 import traceback
 import zipfile
+from pathlib import Path
 from unittest import mock
 
 faulthandler.enable()  # print a Python traceback if QGIS segfaults
@@ -27,9 +28,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from qgis.core import (  # noqa: E402
     Qgis, QgsApplication, QgsCoordinateReferenceSystem, QgsExpression, QgsFeature, QgsGeometry, QgsPointXY,
-    QgsProject, QgsRectangle, QgsVectorLayer)
+    QgsMapRendererParallelJob, QgsMapSettings, QgsProcessingFeedback, QgsProject, QgsRectangle, QgsVectorLayer)
 from qgis.gui import QgsMapCanvas  # noqa: E402
-from qgis.PyQt.QtCore import QCoreApplication, QObject, QSettings, QT_VERSION_STR, pyqtSignal  # noqa: E402
+from qgis.PyQt.QtCore import (  # noqa: E402
+    QCoreApplication, QObject, QSettings, QSize, QTimer, QT_VERSION_STR, pyqtSignal)
+from qgis.PyQt.QtGui import QColor  # noqa: E402
 from qgis.PyQt.QtWidgets import QMainWindow  # noqa: E402
 
 app = QgsApplication([], True)
@@ -371,6 +374,202 @@ def write_las(path, tile, spacing=50):
         for x, y, z, cls in points:
             f.write(struct.pack('<iiiHBBbBH', round(x / scale), round(y / scale), round(z / scale), 100,
                                 0b00001001, cls, 0, 0, 1))  # return 1 of 1
+
+
+def rendered_cloud_points(layer):
+    """Zoom inside the source bounds: VPCs normally show only extents when zoomed out."""
+    settings = QgsMapSettings()
+    settings.setLayers([layer])
+    settings.setDestinationCrs(layer.crs())
+    extent = QgsRectangle(layer.extent())
+    extent.scale(0.8)
+    settings.setExtent(extent)
+    settings.setOutputSize(QSize(300, 300))
+    settings.setBackgroundColor(QColor('white'))
+    job = QgsMapRendererParallelJob(settings)
+    job.start()
+    job.waitForFinished()
+    image = job.renderedImage()
+    points = layer.dataProvider().identify(1000, QgsGeometry.fromRect(extent))
+    # The square building is at the centre; an extent-only layer leaves the centre white.
+    coloured = image.pixelColor(150, 150) != QColor('white')
+    return points, coloured, job.errors()
+
+
+def check_virtual_point_cloud(plugin, tmp):
+    folder = os.path.join(tmp, 'Windows VPC with spaces', '2024')
+    tile = 'SJ90SE'
+    source_dir = os.path.join(folder, tile)
+    os.makedirs(source_dir)
+    files = [os.path.join(source_dir, f'cloud{i}.las') for i in range(2)]
+    for path in files:
+        write_las(path, tile, spacing=1000)
+    originals = [Path(path).read_bytes() for path in files]
+    path = os.path.join(folder, 'mosaics', f'{tile}_{mod.postprocess.file_key(files)}.vpc')
+    os.makedirs(os.path.dirname(path))
+    mod.pointclouds._run('pdal:virtualpointcloud', {
+        'LAYERS': [mod.pointclouds._layer(f) for f in files],
+        'BOUNDARY': False, 'STATISTICS': False, 'OVERVIEW': False, 'OUTPUT': path})
+    mod.pointclouds.fix_vpc_crs(path)
+    layer = mod.QgsPointCloudLayer(path, tile, 'vpc')
+    mod.pointclouds.style_classified(layer)
+    points, coloured, errors = rendered_cloud_points(layer)
+    check(layer.isValid() and layer.pointCount() == 50 and not points and not coloured,
+          "ordinary LAS sources produce a valid-looking VPC but no renderable points")
+    QgsProject.instance().addMapLayer(layer)
+    layer_id = layer.id()
+    renderer = layer.renderer().clone()
+    ticks = []
+    timer = QTimer()
+    timer.timeout.connect(lambda: ticks.append(1))
+    timer.start(10)
+    outcome = mod.LoadOutcome()
+    dataset = mod.api.Dataset('lidar_point_cloud', '2024', 'NaN')
+    tiles = {tile: (folder, [], files, [])}
+    plugin.load_files('Windows VPC regression', dataset, mod.api.POINT_CLOUD, tiles, outcome)
+    if outcome.unjoined:
+        print('VPC preparation errors:', outcome.unjoined, flush=True)
+    timer.stop()
+    check(ticks and outcome.loaded == {tile} and outcome.already == 1 and not outcome.unjoined
+          and QgsProject.instance().mapLayer(layer_id) is layer and layer.renderer().type() == renderer.type(),
+          "COPC preparation runs on a worker, keeps the UI responsive and refreshes the existing VPC layer")
+    points, coloured, errors = rendered_cloud_points(layer)
+    check(layer.crs().authid() == 'EPSG:27700' and points and coloured and not errors
+          and {point['Classification'] for point in points} == {2, 6},
+          "repaired multi-file VPC renders and identifies ground and building points, not just bounds")
+    with open(path, encoding='utf-8') as f:
+        vpc = json.load(f)
+    copies = [os.path.normpath(os.path.join(os.path.dirname(path), item['assets']['data']['href']))
+              for item in vpc['features']]
+    for copy in copies:
+        indexed = mod.pointclouds._layer(copy)
+        check(copy.lower().endswith('.copc.laz') and indexed.dataProvider().hasValidIndex()
+              and indexed.pointCount() == 25 and indexed.crs().authid() == 'EPSG:27700',
+              "cached COPC has a readable spatial index, original point count and British National Grid")
+        indexed = None
+    check([Path(f).read_bytes() for f in files] == originals,
+          "preparing a VPC leaves every downloaded original byte-for-byte unchanged")
+    stats_path = os.path.join(folder, 'mosaics', 'statistics.vpc')
+    mod.pointclouds._run('pdal:virtualpointcloud', {
+        'LAYERS': [mod.pointclouds._layer(copy) for copy in copies],
+        'BOUNDARY': False, 'STATISTICS': True, 'OVERVIEW': False, 'OUTPUT': stats_path})
+    with open(stats_path, encoding='utf-8') as f:
+        statistics = json.load(f)
+    z_stats = [s for item in statistics['features'] for s in item['properties']['pc:statistics']
+               if s['name'] == 'Z']
+    check(len(z_stats) == 2 and all(s['minimum'] == 10.5 and s['maximum'] == 32.5 for s in z_stats),
+          "PDAL calculates the expected height statistics by reading each indexed source")
+    times = [os.stat(f).st_mtime_ns for f in copies + [path]]
+    with mock.patch.object(mod.pointclouds, '_run', side_effect=AssertionError('cache should be reused')):
+        check(not mod.pointclouds.ensure_vpc(files, path)
+              and times == [os.stat(f).st_mtime_ns for f in copies + [path]],
+              "repeated loading reuses COPC and VPC caches without running PDAL or rewriting files")
+    for item in vpc['features']:
+        item['assets']['data']['href'] = item['assets']['data']['href'].replace('/', '\\')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(vpc, f)
+    with mock.patch.object(mod.pointclouds, '_run', side_effect=AssertionError('indexes should be reused')):
+        sources = plugin.tile_cloud_sources(tile, folder, files)
+    with open(path, encoding='utf-8') as f:
+        repaired = json.load(f)
+    check(sources == [(path, tile, 'vpc')]
+          and all('\\' not in item['assets']['data']['href'] for item in repaired['features'])
+          and not mod.pointclouds.fix_vpc_crs(path) and rendered_cloud_points(layer)[0],
+          "cached mixed-separator VPC is repaired idempotently and its existing provider refreshed")
+    QgsProject.instance().removeMapLayer(layer_id)
+    layer = renderer = points = errors = None
+    fresh = mod.LoadOutcome()
+    plugin.load_files('Windows VPC regression', dataset, mod.api.POINT_CLOUD, tiles, fresh)
+    check(fresh.added == 1 and fresh.loaded == {tile} and not fresh.failed and not fresh.unjoined,
+          "cached indexed VPC loads as one tile layer in a fresh project")
+    for loaded in plugin.loaded_layers_for(path):
+        QgsProject.instance().removeMapLayer(loaded.id())
+    loaded = None
+    changed_stat = os.stat(files[0])
+    os.utime(files[0], ns=(changed_stat.st_atime_ns, changed_stat.st_mtime_ns + 1000000000))
+    check(mod.pointclouds.ensure_vpc(files, path)
+          and mod.pointclouds.copc_path(files[0], os.path.dirname(copies[0])) != copies[0],
+          "a changed original gets a new indexed copy and a rebuilt VPC, not a stale cached source")
+    reused = os.path.join(folder, 'mosaics', 'already_copc.vpc')
+    check(mod.pointclouds.ensure_vpc(copies, reused)
+          and all(mod.pointclouds.copc_path(copy, 'unused') == copy for copy in copies),
+          "sources already in COPC format are reused without a second indexed copy")
+    check(plugin.tile_cloud_sources(tile, folder, [copies[0]])[0][2] == 'copc',
+          "a standalone COPC source uses its dedicated QGIS provider, not another PDAL index")
+    cancelled = QgsProcessingFeedback()
+    cancelled.cancel()
+    try:
+        mod.pointclouds.ensure_vpc(files, path, cancelled)
+    except mod.pointclouds.Cancelled:
+        check(times[:2] == [os.stat(f).st_mtime_ns for f in copies],
+              "cancelled preparation raises explicitly and preserves completed indexes")
+    else:
+        check(False, "cancelled preparation raises explicitly")
+    cancel_path = os.path.join(folder, 'cancelled', 'cancelled.vpc')
+
+    def cancel_dialog():
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, mod.PointCloudProgress):
+                for button in widget.findChildren(mod.QPushButton):
+                    if button.text() == 'Cancel':
+                        button.click()
+
+    def slow_conversion(algorithm, parameters, feedback=None, transform_context=None):
+        Path(parameters['OUTPUT']).write_bytes(b'unfinished index')
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            mod.pointclouds._check_cancelled(feedback)
+            time.sleep(0.01)
+        raise AssertionError('cancellation was not delivered to the worker')
+
+    QTimer.singleShot(100, cancel_dialog)
+    with mock.patch.object(mod.pointclouds, '_run', side_effect=slow_conversion):
+        try:
+            plugin.prepare_point_cloud(files, cancel_path)
+        except mod.pointclouds.Cancelled:
+            check(not os.path.exists(cancel_path)
+                  and not list(Path(os.path.dirname(cancel_path)).rglob('*.part.copc.laz')),
+                  "cancelling the progress dialog reaches the worker and removes incomplete indexed copies")
+        else:
+            check(False, "progress dialog cancellation is reported")
+    cancel_outcome = mod.LoadOutcome()
+    with mock.patch.object(plugin, 'tile_cloud_sources', side_effect=mod.pointclouds.Cancelled('cancelled')) as prep:
+        plugin.load_files('Windows VPC regression', dataset, mod.api.POINT_CLOUD,
+                          {tile: tiles[tile], 'SJ90SW': tiles[tile]}, cancel_outcome)
+        check(cancel_outcome.cancelled and prep.call_count == 1 and not cancel_outcome.loaded,
+              "cancelling preparation stops remaining tiles instead of opening another conversion dialog")
+    failed_path = os.path.join(folder, 'mosaics', 'failed.vpc')
+    failure = mod.LoadOutcome()
+    with mock.patch.object(mod.pointclouds, '_run', side_effect=RuntimeError('PDAL diagnostic: test failure')):
+        try:
+            plugin.prepare_point_cloud(files, failed_path)
+        except RuntimeError as e:
+            check('PDAL diagnostic: test failure' in str(e) and not os.path.exists(failed_path),
+                  "worker failure preserves PDAL diagnostics and does not publish a failed VPC")
+        else:
+            check(False, "worker failure is reported")
+    missing = mod.QgsPointCloudLayer(os.path.join(folder, 'missing.laz'), 'missing', 'pdal')
+    check(not plugin.add_layer(missing, plugin.layer_group('Windows VPC regression'), dataset,
+                               mod.api.POINT_CLOUD, failure)
+          and failure.failed and '(pdal)' in failure.failed[0],
+          "failed point-cloud loading records its provider and source")
+    failed_output = os.path.join(folder, 'not_created.vpc')
+
+    def failed_pdal(algorithm, parameters, context=None, feedback=None):
+        feedback.reportError('PDAL refused the input: diagnostic retained')
+        return {'OUTPUT': failed_output}
+
+    with mock.patch('processing.run', side_effect=failed_pdal):
+        try:
+            mod.pointclouds._run('pdal:virtualpointcloud', {'OUTPUT': failed_output})
+        except RuntimeError as e:
+            check('PDAL refused the input' in str(e) and failed_output in str(e),
+                  "PDAL success without an output file is rejected with its original diagnostic")
+        else:
+            check(False, "missing PDAL output is an explicit failure")
+    group = QgsProject.instance().layerTreeRoot().findGroup('Windows VPC regression')
+    if group is not None:
+        QgsProject.instance().layerTreeRoot().removeChildNode(group)
 
 
 def wait_for_task(plugin, timeout=30):
@@ -885,7 +1084,7 @@ def main():
               and 'No data (faint outline)' in legend,
               "legend lists each survey with its tile count")
 
-        # Point clouds: downloaded and loaded as they are, never joined into a mosaic or cropped; .laz found after
+        # Point clouds: no raster mosaic; .laz found after
         # download
         select('SU12NE')  # a completed download clears the selection
         wait_for_search(plugin)
@@ -893,7 +1092,7 @@ def main():
         msgs.clear()
         plugin.create_mosaic_from_selected()
         check(msgs and msgs[-1][1] == Qgis.MessageLevel.Warning and "Point clouds aren't joined" in msgs[-1][0],
-              "Create mosaic on point clouds: says they aren't joined into a mosaic or cropped")
+              "Create mosaic on point clouds: directs loading/cropping to Load selected, not raster mosaics")
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, 'w') as zf:
             zf.writestr('SU12ne.laz', b'not really a laz file')
@@ -1687,8 +1886,38 @@ def main():
         check(QgsProject.instance().crs().authid() == 'EPSG:27700' and bar.popWidget.called,
               "the offer switches the project to EPSG:27700 and closes")
 
-        # --- point clouds load as downloaded, a layer per tile (QGIS 3.32+ with PDAL): never joined or cropped
+        # --- point clouds load as downloaded unless Crop to is ticked (QGIS 3.32+ with PDAL)
         if mod.pointclouds.available():
+            vpc_path = os.path.join(tmp, 'mixed-path.vpc')
+            properties = {'filename': 'C:/Users/Alist/Documents\\LiDAR Data\\tile.laz',
+                          'proj:wkt2': 'British National Grid'}
+            vpc_data = {'features': [{'properties': properties,
+                                      'assets': {'data': {'href': './../SJ90SE\\tile.laz'}}}]}
+            with open(vpc_path, 'w', encoding='utf-8') as f:
+                json.dump(vpc_data, f)
+            changed = mod.pointclouds.fix_vpc_crs(vpc_path)
+            with open(vpc_path, encoding='utf-8') as f:
+                vpc = json.load(f)
+            check(changed and vpc['features'][0]['properties']['filename'] ==
+                  'C:/Users/Alist/Documents/LiDAR Data/tile.laz'
+                  and vpc['features'][0]['assets']['data']['href'] == './../SJ90SE/tile.laz',
+                  "VPC source filenames use separators QGIS can reopen on Windows")
+            vpc['features'][0]['properties'].pop('proj:wkt2')
+            vpc['features'][0]['properties']['proj:bbox'] = [395000, 300000, 10, 400000, 305000, 40]
+            with open(vpc_path, 'w', encoding='utf-8') as f:
+                json.dump(vpc, f)
+            check(mod.pointclouds.fix_vpc_crs(vpc_path), "VPC with missing CRS is repaired")
+            with open(vpc_path, encoding='utf-8') as f:
+                vpc = json.load(f)
+            feature = vpc['features'][0]
+            check(QgsCoordinateReferenceSystem(feature['properties']['proj:wkt2']).authid() == 'EPSG:27700'
+                  and -4 < feature['bbox'][0] < 0 and 50 < feature['bbox'][1] < 56
+                  and not mod.pointclouds.fix_vpc_crs(vpc_path),
+                  "missing-CRS repair sets British National Grid and WGS84 bounds idempotently")
+            check_virtual_point_cloud(plugin, tmp)
+            from crop_test_qgis import check_crops
+            check_crops(mod, check, os.path.join(tmp, 'polygon point cloud crops'), plugin)
+
             cloud_dataset = mod.api.Dataset('lidar_point_cloud', '2015', 'NaN')
             for tile in ('SU12NE', 'SU12NW'):
                 folder = os.path.join(tmp, 'lidar_point_cloud', '2015', tile)
@@ -1717,12 +1946,17 @@ def main():
             select('SU12NE', 'SU12NW')
             check(not mosaic_offered(), "point clouds: no temporary mosaic after downloading either")
 
-            # Never joined into a mosaic or cropped, even with "Crop to" ticked: no save dialog, nothing made
+            # Create mosaic remains raster-only: point cloud crops are made by loading.
             patch = QgsVectorLayer('Polygon?crs=EPSG:27700', 'patch', 'memory')
             feature = QgsFeature()
             feature.setGeometry(QgsGeometry.fromWkt('POLYGON((416000 126000, 418000 126000, 418000 128000, '
                                                     '416000 128000, 416000 126000))'))
             patch.dataProvider().addFeatures([feature])
+            other_feature = QgsFeature()
+            other_feature.setGeometry(QgsGeometry.fromWkt('POLYGON((418500 128500,419000 128500,419000 129000,'
+                                                          '418500 129000,418500 128500))'))
+            patch.dataProvider().addFeatures([other_feature])
+            patch.selectByIds([next(patch.getFeatures()).id()])
             QgsProject.instance().addMapLayer(patch)
             dock.cboLayer.setLayer(patch)
             dock.chkCrop.setChecked(True)
@@ -1731,7 +1965,17 @@ def main():
                 plugin.create_mosaic_from_selected()
             check(not dock.btnCreateVRT.isEnabled() and not save_dialog.called and plugin.post_task is None
                   and msgs and "Point clouds aren't joined" in msgs[-1][0],
-                  "point clouds are never joined or cropped (Create mosaic greyed out, even with Crop to ticked)")
+                  "point clouds crop through loading, not Create mosaic (greyed out even with Crop to ticked)")
+            plugin.load_selected_tiles()
+            cropped_clouds = [lyr for lyr in QgsProject.instance().mapLayers().values()
+                              if isinstance(lyr, mod.QgsPointCloudLayer) and 'cropped to patch' in lyr.name()]
+            check(len(cropped_clouds) == 1 and cropped_clouds[0].pointCount() == 1600
+                  and cropped_clouds[0].providerType() == 'vpc'
+                  and msgs and "Cropped to 'patch'" in msgs[-1][0],
+                  "Load crop on point clouds uses only selected polygon features and exact retained points")
+            check(dock.btnLoadSelected.text() == 'Load crop'
+                  and dock.cboAfterDownload.itemText(dock.cboAfterDownload.findData('tiles')) == 'Load the crop',
+                  "point clouds expose crop loading consistently in manual and after-download controls")
             dock.chkCrop.setChecked(False)
             QgsProject.instance().removeMapLayer(patch.id())
             patch = feature = None  # QGIS deleted the layer: keep no wrapper
@@ -2066,6 +2310,8 @@ def main():
         finally:
             mod.postprocess.add_overviews = real_add_overviews
         check(fine.results.get('ST16NE') is None, "a failure adding overviews doesn't fail the tile")
+        if fine.results.get('ST16NE') is not None:
+            print('Overview regression diagnostics:', fine.results, fine.details, flush=True)
         fine = None
         ds = None
         shutil.rmtree(os.path.join(tmp, 'mix'), ignore_errors=True)

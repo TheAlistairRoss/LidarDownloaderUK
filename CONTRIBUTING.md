@@ -53,6 +53,29 @@ The smoke test runs the whole plugin headless inside QGIS, with a faked network:
 
 GitHub Actions runs all of these on QGIS 3.22, 3.34, 3.40, 3.44 (Qt5) and 4.2 (Qt6) for every pull request.
 
+The point-cloud smoke checks use tiny synthetic files, without downloading data. With PDAL available they
+reproduce a valid-looking but unrenderable VPC over ordinary LAS files, then verify COPC conversion, real
+point rendering and identification, preservation of the originals, cache reuse/invalidation, Windows path
+repair, existing-layer refresh, worker progress/cancellation and diagnostic failures. These checks do not
+just assert that a VPC exists or `isValid()` returns true. Point clouds are skipped when PDAL is unavailable.
+
+For a Windows manual regression, use QGIS 3.44.13, England point cloud (individual surveys), 2024, tile
+SJ90SE. Load the existing downloads with the updated plugin, wait for COPC preparation, and zoom inside
+one source file's extent. Check that classified points appear and can be identified, the layer uses
+EPSG:27700, and there are no source-open warnings in Log Messages. Remove and load the layer again:
+the indexed copies should be reused. Save/reopen the project to check persisted VPC references. Keep
+the VPC's `mosaics/pointcloud_indexes/` folder; the original LAZ files are not modified by preparation.
+Record the plugin installation path as well as its version to distinguish a local fix from a release
+with the same version number.
+
+Exact polygon point-cloud checks also run in the full QGIS smoke suite. For a focused check on Windows,
+run QGIS's `python-qgis-ltr.bat` with the absolute path to `tests\crop_test_qgis.py`. It uses a temporary
+directory and removes its synthetic sources/results afterwards. The checks cover
+header rejection without full-source indexing, exact holes/multipart/overlapping polygons, point
+coordinates and LAS attributes, CRS preservation/BNG fallback, LAS/LAZ/existing COPC inputs, crop cache
+identity/reuse, empty results, cancellation/error cleanup, Processing output and untouched originals.
+The full smoke suite adds the modal worker and dock loading checks plus existing raster regressions.
+
 ### Code guidelines
 
 - **One codebase for QGIS 3 and QGIS 4.** Follow the compatibility rules in the README: import Qt only through `qgis.PyQt`, use fully scoped enums, `exec()` not `exec_()`, and guard APIs newer than QGIS 3.22.

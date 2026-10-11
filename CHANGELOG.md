@@ -2,6 +2,27 @@
 
 All notable changes to LIDAR Downloader UK, newest first. 0.14.3 is the first public release: the changelog in the plugin's `metadata.txt` (shown in QGIS's Plugin Manager and on plugins.qgis.org) starts there, and the versions before it are the plugin's development history.
 
+## Unreleased
+
+- **Exact point-cloud polygon loading:** Crop to now clips LAS/LAZ to selected polygons, including
+  holes and multipart sites. Actual file-header bounds reject outside files before indexing;
+  intersecting ordinary files are cropped first and only retained points become COPC/VPC copies.
+  Crops preserve coordinates, attributes and CRS (missing CRS assumes BNG), leave downloads untouched,
+  and cache separately by polygon and source path/size/mtime. Empty crops/errors warn without
+  substituting whole clouds. Manual loading, loading after download and My Downloads share this path.
+- The Processing download tool has an optional polygon-cropped point-cloud VPC output; existing
+  raster VRT/GeoTIFF contracts are unchanged. Create mosaic remains raster-only.
+- Multi-file point-cloud tiles now use cached COPC copies so QGIS can render the VPC's points, not just
+  file extents. The originals are unchanged; preparation has progress and cancellation and works with
+  QGIS 3.44 without the QGIS 4.0 `CONVERT_COPC` option.
+- Existing VPCs are rebuilt over indexed sources when needed, Windows asset separators are normalised,
+  and layers already in the project are refreshed after repair. QGIS's sibling COPC indexes are not
+  counted as additional downloaded sources.
+- Loading failures retain provider/PDAL diagnostics and no longer describe PDAL preparation as a GDAL
+  failure. The point-cloud message no longer suggests that Create mosaic can crop point clouds.
+- Real-QGIS regression checks cover multi-file rendering and point access, cache reuse/invalidation,
+  preservation of originals, Windows path repair, worker cancellation and error reporting.
+
 ## 0.14.6
 
 Changes from the first live use, to make the plugin simpler and keep the data exactly as downloaded.
